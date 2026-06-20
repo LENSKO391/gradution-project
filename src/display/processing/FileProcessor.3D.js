@@ -135,11 +135,35 @@ const encodeToStlWithEmbeddedData = async (originalBytes, dataBytes, password) =
   const view             = new DataView(originalBytes.buffer, originalBytes.byteOffset, originalBytes.byteLength);
   const maxPayloadBytes  = originalTriCount * 2; // 2 bytes attribute لكل مثلث
 
+  const distorted = new Uint8Array(originalBytes.length);
+  distorted.set(originalBytes);
+
+  // التشويه البصري للـ vertices
+  if (password) {
+    const salt      = new Uint8Array([0xDE, 0xAD, 0xBE, 0xEF]);
+    const key       = await CryptoEngine.deriveKey({ password, salt, iterations: 500 });
+    const keystream = new Uint8Array(
+      await crypto.subtle.encrypt({ name: 'AES-GCM', iv: new Uint8Array(12) }, key, new Uint8Array(65536))
+    );
+    let kpos = 0;
+    for (let t = 0; t < originalTriCount; t++) {
+      const triOffset = 84 + t * 50;
+      for (let v = 0; v < 3; v++) {
+        for (let c = 0; c < 3; c++) {
+          const floatOffset = triOffset + 12 + v * 12 + c * 4;
+          const origFloat   = view.getFloat32(floatOffset, true);
+          const factor      = 0.5 + (keystream[kpos % keystream.length] / 255);
+          const fb = new Uint8Array(4);
+          new DataView(fb.buffer).setFloat32(0, origFloat * factor, true);
+          for (let b = 0; b < 4; b++) distorted[floatOffset + b] = fb[b];
+          kpos++;
+        }
+      }
+    }
+  }
+
   if (dataBytes.length + 8 <= maxPayloadBytes) {
     // الطريقة 1: تخزين في attribute bytes
-    const distorted = new Uint8Array(originalBytes.length);
-    distorted.set(originalBytes);
-
     let dataPos = 0;
     for (let t = 0; t < originalTriCount && dataPos < dataBytes.length + 4; t++) {
       const attrOffset = 84 + t * 50 + 48; // موقع attribute bytes
@@ -157,40 +181,15 @@ const encodeToStlWithEmbeddedData = async (originalBytes, dataBytes, password) =
         const remaining    = dataBytes.length - (dataPos - 4);
         const bytesToWrite = Math.min(2, remaining);
         for (let i = 0; i < bytesToWrite; i++) {
-          distorted[attrOffset + i] = dataBytes[dataPos - 4 + i];
+          distorted[attrOffset + i] = dataBytes[dataPos - 4];
           dataPos++;
         }
       }
     }
-
-    // التشويه البصري للـ vertices
-    if (password) {
-      const salt      = new Uint8Array([0xDE, 0xAD, 0xBE, 0xEF]);
-      const key       = await CryptoEngine.deriveKey({ password, salt, iterations: 500 });
-      const keystream = new Uint8Array(
-        await crypto.subtle.encrypt({ name: 'AES-GCM', iv: new Uint8Array(12) }, key, new Uint8Array(65536))
-      );
-      let kpos = 0;
-      for (let t = 0; t < originalTriCount; t++) {
-        const triOffset = 84 + t * 50;
-        for (let v = 0; v < 3; v++) {
-          for (let c = 0; c < 3; c++) {
-            const floatOffset = triOffset + 12 + v * 12 + c * 4;
-            const origFloat   = view.getFloat32(floatOffset, true);
-            const factor      = 0.5 + (keystream[kpos % keystream.length] / 255);
-            const fb = new Uint8Array(4);
-            new DataView(fb.buffer).setFloat32(0, origFloat * factor, true);
-            for (let b = 0; b < 4; b++) distorted[floatOffset + b] = fb[b];
-            kpos++;
-          }
-        }
-      }
-    }
-
     return new Blob([distorted], { type: 'application/sla' });
   } else {
     // الطريقة 2 (fallback): إلحاق CVLT في نهاية الملف
-    return appendCVLTPayload(originalBytes, dataBytes);
+    return appendCVLTPayload(distorted, dataBytes);
   }
 };
 

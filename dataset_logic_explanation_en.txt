@@ -1,0 +1,54 @@
+Explanation of the Programming Logic for the Dataset Section
+
+The core idea here is "data encapsulation." The system takes the original file's data, encrypts it, and then manipulates the format of this encrypted data to make it look like a regular text CSV file. This ensures the file can be saved or transmitted without being rejected by other systems.
+
+=========================================================================
+First: The Encryption Process Flow
+=========================================================================
+When a user uploads a dataset file (whether an Excel or CSV file) and chooses to encrypt it, the following steps occur:
+
+1. Conversion to Raw Data (Bytes):
+Instead of reading the file as text (which could corrupt complex Excel files), the system reads the file from its root as binary data or "bytes." This data is saved in a dedicated array. This means the file, regardless of its type, has now become just a sequence of numbers.
+
+2. The Complex Encryption Process:
+These bytes, along with the password entered by the user, are sent to the "encryption engine". The engine applies complex encryption algorithms and returns a programmatic object (data package) containing:
+* Ciphertext: The original data after being encrypted.
+* Initialization Vector (IV): Random data used to securely start the encryption.
+* Salt: Random data added to strengthen the password.
+
+3. Preserving File Identity:
+Because the encrypted file will completely change its format, the system saves "metadata" inside the data package. The system adds the original file name and file type. This step is absolutely crucial so the system can restore the file to its original format and name when decrypting it later.
+
+4. Conversion to Safe Text:
+We now have a programmatic object, and it cannot be saved directly into a file. Therefore, the system does the following:
+* Converts it to text.
+* Processes it to ensure there are no strange characters that might corrupt the file.
+* Converts the entire text into a format called Base64. This format ensures that all characters used are English letters and regular numbers, completely safe and causing no errors when saving.
+
+5. Splitting and Formatting the File:
+Here lies the clever trick! The safe text produced in the previous step is very long. If saved on a single line, viewing programs might crash. To avoid this, the system splits this very long text into "chunks", with each chunk being 30,000 characters long.
+The system treats each chunk as a new "row" and joins these rows together. The final result is encrypted data that looks exactly like a CSV data file containing thousands of rows and only one column!
+
+6. File Download:
+Finally, this split text is presented to the user to download as an encrypted file, and the system records this operation in the history log.
+
+
+=========================================================================
+Second: The Decryption Process Flow
+=========================================================================
+When the user uploads the encrypted file to open it, the system reverses the process as follows:
+
+1. Reading the File and Reassembling Chunks:
+Because the system knows it formatted the encrypted file as text split into rows, it reads it as regular text. The system reads each line, removes empty lines, and then merges all these lines together to reconstruct the original long text (the safe text).
+
+2. Deconstruction and Package Restoration:
+The system reverses the conversions it previously performed. It converts the safe text back into a programmatic object.
+
+3. File Validation:
+Before attempting to decrypt, the system verifies that this package actually contains the "ciphertext", "initialization vector", and other keys. If the user mistakenly uploads a regular file, the system will detect it here and stop to inform the user of an error.
+
+4. The Actual Decryption:
+The system sends the extracted package along with the password to the "encryption engine". The engine performs its reverse mathematical operations and returns the raw data (the original bytes) of the file.
+
+5. Restoring the Original File:
+Using the "metadata" that was saved during the encryption phase (which is the file name and type), the system knows exactly what this file was. It encapsulates the raw data that has been decrypted, returns it to its original format (e.g., an Excel file), and presents it to the user ready to download and use.

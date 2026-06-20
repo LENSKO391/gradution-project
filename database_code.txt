@@ -1,0 +1,463 @@
+
+
+// --- File: ./src/FirebaseAuth.js ---
+
+import { initializeApp } from "firebase/app";
+import { 
+  getAuth, 
+  signInWithPopup, 
+  GoogleAuthProvider, 
+  signOut,
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  sendPasswordResetEmail,
+  fetchSignInMethodsForEmail,
+  updateProfile
+} from "firebase/auth";
+import { getFirestore } from "firebase/firestore";
+import { getStorage } from "firebase/storage";
+
+// TODO: Replace with your actual Firebase Project Configuration
+// You can find this in your Firebase Console -> Project Settings -> General
+export const firebaseConfig = {
+  apiKey: "AIzaSyDvi1I4VLxny6aspAAbJnYFDEE-e7oru-E",
+  authDomain: "encryption-decryption-de3cd.firebaseapp.com",
+  projectId: "encryption-decryption-de3cd",
+  storageBucket: "encryption-decryption-de3cd.firebasestorage.app",
+  messagingSenderId: "595294222148",
+  appId: "1:595294222148:web:4cdb7633d2c288cb7ec911",
+  measurementId: "G-NRGMHB32M4"
+};
+
+let app;
+export let auth;
+export let db;
+export let storage;
+
+console.log("Firebase Auth/DB initialized. Please ensure Email/Password and Google providers are enabled in Firebase Console.");
+
+try {
+  if (firebaseConfig.apiKey && firebaseConfig.apiKey !== "YOUR_API_KEY") {
+    app = initializeApp(firebaseConfig);
+    auth = getAuth(app);
+    db = getFirestore(app);
+    storage = getStorage(app);
+  }
+} catch(e) {
+  console.warn("Firebase not properly configured:", e.message);
+}
+
+export const registerWithEmail = async (name, email, password) => {
+  if (!auth) throw new Error("Firebase not initialized.");
+  const res = await createUserWithEmailAndPassword(auth, email, password);
+  await updateProfile(res.user, { displayName: name });
+  return res.user;
+};
+
+export const loginWithEmail = async (email, password) => {
+  if (!auth) throw new Error("Firebase not initialized.");
+  const res = await signInWithEmailAndPassword(auth, email, password);
+  return res.user;
+};
+
+export const resetPassword = async (email) => {
+  if (!auth) throw new Error("Firebase not initialized.");
+  // Check if the email is registered before sending a reset link
+  const methods = await fetchSignInMethodsForEmail(auth, email);
+  if (!methods || methods.length === 0) {
+    throw new Error("No account found with this email address. Please sign up first.");
+  }
+  await sendPasswordResetEmail(auth, email);
+};
+
+export const googleSignIn = async () => {
+  if (!auth) throw new Error("Firebase config is missing in src/FirebaseAuth.js. Please update it with your actual keys from Firebase Console.");
+  
+  const provider = new GoogleAuthProvider();
+  // Request Gmail Send scope so the user can send emails from their account
+  provider.addScope('https://www.googleapis.com/auth/gmail.send');
+  
+  try {
+    const result = await signInWithPopup(auth, provider);
+    const credential = GoogleAuthProvider.credentialFromResult(result);
+    const token = credential.accessToken;
+    const user = result.user;
+    
+    return {
+      user: {
+        name: user.displayName,
+        email: user.email,
+        photoURL: user.photoURL,
+        historyPin: '' // Maintain compatibility with your History system
+      },
+      accessToken: token
+    };
+  } catch (error) {
+    throw new Error(error.message);
+  }
+};
+
+export const logoutUser = () => {
+    if(!auth) return;
+    return signOut(auth);
+};
+
+
+// --- File: ./src/FirebaseStorage.js ---
+
+import { storage, db } from './FirebaseAuth';
+import { ref, uploadBytes, getDownloadURL, deleteObject } from 'firebase/storage';
+import {
+  collection, addDoc, getDocs, deleteDoc,
+  doc, query, where, orderBy
+} from 'firebase/firestore';
+
+// ── Upload an encrypted file to Firebase Storage and record it in Firestore ──
+export async function uploadEncryptedFile(userEmail, blob, fileName, action, mimeType) {
+  if (!storage || !db) throw new Error('Firebase not initialized.');
+
+  // 1. Upload the file blob to Firebase Storage under the user's folder
+  const storageRef = ref(storage, `encrypted_files/${userEmail}/${Date.now()}_${fileName}`);
+  const snapshot = await uploadBytes(storageRef, blob, { contentType: mimeType });
+  const downloadURL = await getDownloadURL(snapshot.ref);
+
+  // 2. Add a record to Firestore (no raw file data stored in the DB)
+  const docRef = await addDoc(collection(db, 'historyRecords'), {
+    email: userEmail,
+    file: fileName,
+    action,
+    mimeType,
+    storagePath: snapshot.ref.fullPath,
+    downloadURL,
+    date: new Date().toISOString(),
+  });
+
+  return { id: docRef.id, downloadURL };
+}
+
+// ── Fetch all history records for a user from Firestore ──
+export async function getHistoryRecords(userEmail) {
+  if (!db) return [];
+  const q = query(
+    collection(db, 'historyRecords'),
+    where('email', '==', userEmail),
+    orderBy('date', 'desc')
+  );
+  const snapshot = await getDocs(q);
+  return snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+}
+
+// ── Delete a single history record (and its file from Storage) ──
+export async function deleteHistoryRecord(record) {
+  if (!db) return;
+  // Delete Firestore document
+  await deleteDoc(doc(db, 'historyRecords', record.id));
+  // Delete the file from Storage if a path exists
+  if (storage && record.storagePath) {
+    try {
+      await deleteObject(ref(storage, record.storagePath));
+    } catch (e) {
+      console.warn('Could not delete file from storage:', e.message);
+    }
+  }
+}
+
+// ── Delete all history records for a user ──
+export async function deleteAllHistoryRecords(userEmail) {
+  if (!db) return;
+  const q = query(collection(db, 'historyRecords'), where('email', '==', userEmail));
+  const snapshot = await getDocs(q);
+  for (const docSnap of snapshot.docs) {
+    const data = docSnap.data();
+    await deleteDoc(doc(db, 'historyRecords', docSnap.id));
+    if (storage && data.storagePath) {
+      try {
+        await deleteObject(ref(storage, data.storagePath));
+      } catch (e) {
+        console.warn('Could not delete file from storage:', e.message);
+      }
+    }
+  }
+}
+
+
+// --- File: ./src/HistoryStore.js ---
+
+import { auth, db } from './FirebaseAuth';
+import { collection, addDoc, getDocs, deleteDoc, query, where, serverTimestamp, doc } from "firebase/firestore";
+
+// No Firebase Storage import — Storage requires a paid plan.
+// History records are saved as metadata-only logs in Firestore.
+// The file itself is still downloaded to the user's device as normal;
+// it just won't be re-downloadable from the history panel.
+
+export class HistoryStore {
+    static normalizeDate(value) {
+        if (!value) return new Date().toISOString();
+        if (typeof value === 'string') return value;
+        if (value?.toDate && typeof value.toDate === 'function') return value.toDate().toISOString();
+        return new Date().toISOString();
+    }
+
+    // Wait for Firebase Auth to finish hydrating before reading currentUser.
+    // auth.currentUser is null during the async initialization window on page
+    // load — reading it directly caused addRecord to silently fail every time.
+    static waitForAuth(timeoutMs = 5000) {
+        return new Promise((resolve, reject) => {
+            if (auth?.currentUser) return resolve(auth.currentUser);
+
+            const timer = setTimeout(() => {
+                unsubscribe();
+                reject(new Error("Auth timeout — please sign in again."));
+            }, timeoutMs);
+
+            const unsubscribe = auth.onAuthStateChanged((user) => {
+                clearTimeout(timer);
+                unsubscribe();
+                if (user) resolve(user);
+                else reject(new Error("You must be signed in to save history."));
+            });
+        });
+    }
+
+    static async addRecord(email, record) {
+        if (!db) throw new Error("Firebase DB not initialized.");
+
+        let currentUser;
+        try {
+            currentUser = await HistoryStore.waitForAuth();
+        } catch (authErr) {
+            console.warn("HistoryStore.addRecord: skipped (not authenticated):", authErr.message);
+            return null;
+        }
+
+        const normalizedEmail = (currentUser.email || email || '').trim().toLowerCase();
+
+        // Save metadata only — no file bytes in Firestore, no Storage upload
+        try {
+            const docData = {
+                userId: currentUser.uid,
+                email: currentUser.email || email,
+                emailLower: normalizedEmail,
+                file: record.file,
+                action: record.action,
+                mimeType: record.mimeType || 'application/octet-stream',
+                date: serverTimestamp(),
+                downloadURL: null,   // no Storage — file was already downloaded to device
+                storagePath: null
+            };
+
+            const docRef = await addDoc(collection(db, "historyRecords"), docData);
+            console.log("History record saved:", docRef.id);
+            return docRef.id;
+        } catch (err) {
+            console.error("HistoryStore: Firestore write failed:", err.message);
+            throw err;
+        }
+    }
+
+    static async getRecords() {
+        if (!db) return [];
+
+        let currentUser;
+        try {
+            currentUser = await HistoryStore.waitForAuth();
+        } catch {
+            return [];
+        }
+
+        try {
+            const q = query(
+                collection(db, "historyRecords"),
+                where("userId", "==", currentUser.uid)
+            );
+            const snapshot = await getDocs(q);
+            return snapshot.docs
+                .map(docSnap => {
+                    const data = docSnap.data();
+                    return { id: docSnap.id, ...data, date: HistoryStore.normalizeDate(data.date) };
+                })
+                .sort((a, b) => new Date(b.date) - new Date(a.date));
+        } catch (err) {
+            console.error("HistoryStore.getRecords failed:", err.message);
+            return [];
+        }
+    }
+
+    static async deleteRecord(id, storagePath = null) {
+        if (!db) return;
+        // storagePath is always null now but kept for API compatibility with HistoryPanel
+        await deleteDoc(doc(db, "historyRecords", id));
+    }
+
+    static async deleteAllRecords() {
+        if (!db) return;
+
+        let currentUser;
+        try { currentUser = await HistoryStore.waitForAuth(); }
+        catch { return; }
+
+        const snapshot = await getDocs(
+            query(collection(db, "historyRecords"), where("userId", "==", currentUser.uid))
+        );
+        for (const docSnap of snapshot.docs) {
+            await deleteDoc(doc(db, "historyRecords", docSnap.id));
+        }
+    }
+}
+
+// --- File: ./src/display/core/AccountManager.js ---
+
+// =============================================================================
+// AccountManager.js — إدارة حسابات المستخدمين والجلسات
+// =============================================================================
+// هذه الـ class مسؤولة عن:
+//   1. حفظ بيانات المستخدمين في localStorage (بجانب Firebase)
+//   2. إدارة الجلسة النشطة (تسجيل دخول / خروج)
+//   3. تغيير كلمة السر
+//
+// ملاحظة: المصادقة الحقيقية تتم عبر Firebase. هذه الـ class تحفظ
+// بيانات الجلسة المحلية (الاسم، البريد، historyPin) فقط.
+// =============================================================================
+
+class AccountManager {
+
+  // ---------------------------------------------------------------------------
+  // مفاتيح localStorage
+  // ---------------------------------------------------------------------------
+  static ACCOUNTS_KEY = 'encryptionSystemAccounts'; // قائمة الحسابات
+  static USER_KEY     = 'encryptionSystemLoggedInUser'; // الجلسة النشطة
+
+  // ---------------------------------------------------------------------------
+  // دوال خاصة للقراءة والكتابة في localStorage
+  // ---------------------------------------------------------------------------
+
+  /**
+   * يقرأ قيمة من localStorage ويحوّلها من JSON.
+   * إذا فشل أو كانت فارغة، يُعيد القيمة الافتراضية.
+   * @private
+   */
+  static #read(key, fallback) {
+    try {
+      const r = localStorage.getItem(key);
+      return r ? JSON.parse(r) : fallback;
+    } catch {
+      return fallback; // في حالة الخطأ (مثلاً JSON تالف)
+    }
+  }
+
+  /**
+   * يكتب قيمة في localStorage بعد تحويلها إلى JSON.
+   * @private
+   */
+  static #write(key, value) {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+    } catch (e) {
+      console.error(`Could not save ${key}`, e);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Constructor
+  // ---------------------------------------------------------------------------
+  constructor() {
+    // عند إنشاء instance، نقرأ قائمة الحسابات المحفوظة
+    this.accounts = AccountManager.#read(AccountManager.ACCOUNTS_KEY, []);
+  }
+
+  /** يحفظ قائمة الحسابات الحالية في localStorage @private */
+  #save() {
+    AccountManager.#write(AccountManager.ACCOUNTS_KEY, this.accounts);
+  }
+
+  // ---------------------------------------------------------------------------
+  // find — البحث عن حساب بالإيميل
+  // ---------------------------------------------------------------------------
+  /**
+   * @param {string} email
+   * @returns {Object|null} الحساب أو null إذا لم يوجد
+   */
+  find({ email }) {
+    return this.accounts.find(a => a.email === email) || null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // register — تسجيل حساب جديد
+  // ---------------------------------------------------------------------------
+  /**
+   * يُضيف حساباً جديداً للقائمة المحلية.
+   * (المصادقة الفعلية تتم عبر Firebase registerWithEmail)
+   *
+   * @param {string} name
+   * @param {string} email
+   * @param {string} password
+   * @param {string} historyPin - PIN اختياري لقفل سجل العمليات
+   * @throws إذا كانت الحقول ناقصة أو الإيميل مستخدم مسبقاً
+   */
+  register({ name, email, password, historyPin = '' }) {
+    if (!name || !email || !password)
+      throw new Error('Please fill in all fields.');
+    if (this.accounts.some(a => a.email === email))
+      throw new Error('An account with this email already exists.');
+
+    const account = { name, email, password, historyPin };
+    this.accounts.push(account);
+    this.#save();
+    return account;
+  }
+
+  // ---------------------------------------------------------------------------
+  // login — التحقق من بيانات الدخول
+  // ---------------------------------------------------------------------------
+  /**
+   * يتحقق من الإيميل وكلمة السر في القائمة المحلية.
+   * (المصادقة الفعلية تتم عبر Firebase loginWithEmail)
+   *
+   * @throws إذا كانت البيانات خاطئة
+   */
+  login({ email, password }) {
+    const account = this.accounts.find(
+      a => a.email === email && a.password === password
+    );
+    if (!account) throw new Error('Invalid email or password.');
+    return { email: account.email, name: account.name, historyPin: account.historyPin };
+  }
+
+  // ---------------------------------------------------------------------------
+  // changePassword — تغيير كلمة السر
+  // ---------------------------------------------------------------------------
+  /**
+   * يغيّر كلمة السر بعد التحقق من القديمة.
+   * @throws إذا كانت كلمة السر القديمة خاطئة
+   */
+  changePassword({ email, oldPassword, newPassword }) {
+    const idx = this.accounts.findIndex(a => a.email === email);
+    if (idx < 0) throw new Error('User account not found.');
+    if (this.accounts[idx].password !== oldPassword)
+      throw new Error('Incorrect old password.');
+    this.accounts[idx].password = newPassword;
+    this.#save();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Session Management — إدارة الجلسة
+  // ---------------------------------------------------------------------------
+
+  /** يحفظ بيانات المستخدم في localStorage كجلسة نشطة */
+  persistSession({ user }) {
+    AccountManager.#write(AccountManager.USER_KEY, user);
+  }
+
+  /** يمسح الجلسة النشطة (عند تسجيل الخروج) */
+  clearSession() {
+    localStorage.removeItem(AccountManager.USER_KEY);
+  }
+
+  /** يقرأ الجلسة النشطة (لاستعادة الجلسة عند إعادة فتح التطبيق) */
+  getSession() {
+    return AccountManager.#read(AccountManager.USER_KEY, null);
+  }
+}
+
+export default AccountManager;

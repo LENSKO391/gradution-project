@@ -750,16 +750,43 @@ static async encodeToStlWithEmbeddedData(originalBytes, dataBytes, password) {
   const view = new DataView(workingBytes.buffer, workingBytes.byteOffset, workingBytes.byteLength);
   const originalTriCount = new DataView(workingBytes.buffer, workingBytes.byteOffset, workingBytes.byteLength).getUint32(80, true);
   
+  // ALWAYS APPLY VISUAL DISTORTION
+  const distorted = new Uint8Array(workingBytes.length);
+  distorted.set(workingBytes);
+  
+  if (password) {
+    const salt = new Uint8Array([0xDE, 0xAD, 0xBE, 0xEF]);
+    const key = await CryptoEngine.deriveKey({ password, salt, iterations: 500 });
+    const zeroArray = new Uint8Array(65536);
+    const keystream = new Uint8Array(await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv: new Uint8Array(12) }, key, zeroArray
+    ));
+    
+    let kpos = 0;
+    for (let t = 0; t < originalTriCount; t++) {
+      const triOffset = 84 + t * 50;
+      for (let v = 0; v < 3; v++) {
+        for (let c = 0; c < 3; c++) {
+          const floatOffset = triOffset + 12 + v * 12 + c * 4;
+          const origFloat = view.getFloat32(floatOffset, true);
+          const factor = 0.5 + (keystream[kpos % keystream.length] / 255);
+          const newFloat = origFloat * factor;
+          const bytes = new Uint8Array(4);
+          new DataView(bytes.buffer).setFloat32(0, newFloat, true);
+          for (let b = 0; b < 4; b++) {
+            distorted[floatOffset + b] = bytes[b];
+          }
+          kpos++;
+        }
+      }
+    }
+  }
+
   // Check if we have enough space in attribute bytes (2 bytes per triangle)
   const maxPayloadBytes = originalTriCount * 2;
   
   if (dataBytes.length + 8 <= maxPayloadBytes) {
     // Small payload: store entirely in attribute bytes
-    const distorted = new Uint8Array(workingBytes.length);
-    distorted.set(workingBytes);
-    
-    // Write magic 'CV' (2 bytes) at start of attribute bytes of first triangle
-    // Write length, then data
     let dataPos = 0;
     for (let t = 0; t < originalTriCount && dataPos < dataBytes.length + 4; t++) {
       const attrOffset = 84 + t * 50 + 48; // attribute bytes location
@@ -769,7 +796,6 @@ static async encodeToStlWithEmbeddedData(originalBytes, dataBytes, password) {
         distorted[attrOffset + 1] = 0x56; // 'V'
         dataPos = 2;
       } else if (t === 1) {
-        // Write length in next 2 bytes
         distorted[attrOffset] = (dataBytes.length >> 8) & 0xFF;
         distorted[attrOffset + 1] = dataBytes.length & 0xFF;
         dataPos += 2;
@@ -777,42 +803,11 @@ static async encodeToStlWithEmbeddedData(originalBytes, dataBytes, password) {
         const remaining = dataBytes.length - (dataPos - 4);
         const bytesToWrite = Math.min(2, remaining);
         for (let i = 0; i < bytesToWrite && dataPos - 4 < dataBytes.length; i++) {
-          distorted[attrOffset + i] = dataBytes[dataPos - 4 + i];
+          distorted[attrOffset + i] = dataBytes[dataPos - 4];
           dataPos++;
         }
       }
     }
-    
-    // Apply visual distortion to vertices so it looks encrypted
-    if (password) {
-      const salt = new Uint8Array([0xDE, 0xAD, 0xBE, 0xEF]);
-      const key = await CryptoEngine.deriveKey({ password, salt, iterations: 500 });
-      const zeroArray = new Uint8Array(65536);
-      const keystream = new Uint8Array(await crypto.subtle.encrypt(
-        { name: 'AES-GCM', iv: new Uint8Array(12) }, key, zeroArray
-      ));
-      
-      let kpos = 0;
-      for (let t = 0; t < originalTriCount; t++) {
-        const triOffset = 84 + t * 50;
-        // Distort vertex coordinates slightly (scale by 0.5-1.5)
-        for (let v = 0; v < 3; v++) {
-          for (let c = 0; c < 3; c++) {
-            const floatOffset = triOffset + 12 + v * 12 + c * 4;
-            const origFloat = view.getFloat32(floatOffset, true);
-            const factor = 0.5 + (keystream[kpos % keystream.length] / 255);
-            const newFloat = origFloat * factor;
-            const bytes = new Uint8Array(4);
-            new DataView(bytes.buffer).setFloat32(0, newFloat, true);
-            for (let b = 0; b < 4; b++) {
-              distorted[floatOffset + b] = bytes[b];
-            }
-            kpos++;
-          }
-        }
-      }
-    }
-    
     return new Blob([distorted], { type: 'application/sla' });
   } else {
     // Large payload: use fallback (file will be invalid for fstl, but works for other viewers)
@@ -821,11 +816,11 @@ static async encodeToStlWithEmbeddedData(originalBytes, dataBytes, password) {
     const lenBuf = new Uint8Array(4);
     new DataView(lenBuf.buffer).setUint32(0, dataBytes.length, true);
     
-    const result = new Uint8Array(workingBytes.length + 4 + 4 + dataBytes.length);
-    result.set(workingBytes, 0);
-    result.set(magic, workingBytes.length);
-    result.set(lenBuf, workingBytes.length + 4);
-    result.set(dataBytes, workingBytes.length + 8);
+    const result = new Uint8Array(distorted.length + 4 + 4 + dataBytes.length);
+    result.set(distorted, 0);
+    result.set(magic, distorted.length);
+    result.set(lenBuf, distorted.length + 4);
+    result.set(dataBytes, distorted.length + 8);
     
     return new Blob([result], { type: 'application/octet-stream' });
   }
@@ -1794,13 +1789,15 @@ useEffect(() => {
         </div>
 
         <div className="bg-slate-800 rounded-xl border border-slate-700/80 p-6 shadow-xl">
-          <div className="mb-5">
-            <h2 className="text-lg font-bold text-white flex items-center gap-2">
-              {ActiveIcon && <ActiveIcon size={18} className="text-cyan-400" />}
-              {TAB_TITLES[activeTab]}
-            </h2>
-            <p className="text-slate-400 text-xs mt-1">{TAB_DESCRIPTIONS[activeTab]}</p>
-          </div>
+          {activeTab !== 'history' && (
+            <div className="mb-5">
+              <h2 className="text-lg font-bold text-white flex items-center gap-2">
+                {ActiveIcon && <ActiveIcon size={18} className="text-cyan-400" />}
+                {TAB_TITLES[activeTab]}
+              </h2>
+              <p className="text-slate-400 text-xs mt-1">{TAB_DESCRIPTIONS[activeTab]}</p>
+            </div>
+          )}
           {activeTab === 'file' && <TextFileCryptoPanel user={user} />}
           {activeTab === 'textarea' && <TextAreaCryptoPanel user={user} />}
           {activeTab === 'image' && <ImageCryptoPanel user={user} forcedDimension="2d" />}
